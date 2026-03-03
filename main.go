@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,7 +16,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// SlotRequest is the payload for scanning available slots
+// SlotRequest represents the payload to fetch available slots
 type SlotRequest struct {
 	CourseType      string      `json:"courseType"`
 	InsInstructorId string      `json:"insInstructorId"`
@@ -24,63 +25,67 @@ type SlotRequest struct {
 	SubVehicleType  interface{} `json:"subVehicleType"`
 }
 
-// SlotResponse represents a single slot from the API response
-type SlotResponse struct {
-	Date       string `json:"date"`       // adjust field names based on actual response
-	StartTime  string `json:"startTime"`  // adjust field names based on actual response
-	EndTime    string `json:"endTime"`    // adjust field names based on actual response
-	Instructor string `json:"instructor"` // optional
+// Slot represents a single slot returned by the API
+type Slot struct {
+	BookingDate string `json:"bookingDate"`
+	StartTime   string `json:"startTime"`
+	EndTime     string `json:"endTime"`
+	Instructor  string `json:"instructorName"`
+	Vehicle     string `json:"vehicleType"`
+}
+
+// ApiResponse represents the JSON response structure
+type ApiResponse struct {
+	Data []Slot `json:"data"`
 }
 
 func main() {
-	// Load environment variables
+	// Load .env variables
+	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("Error loading .env file:", err)
+		log.Println("Warning: .env file not found, relying on environment variables")
 	}
 
 	botToken := os.Getenv("TELEGRAM_TOKEN")
-	chatIDStr := os.Getenv("CHAT_ID")
-	apiToken := os.Getenv("BBDC_API_TOKEN")
-
-	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
-	if err != nil {
-		log.Fatal("Invalid CHAT_ID:", err)
-	}
-
+	chatID, _ := strconv.ParseInt(os.Getenv("CHAT_ID"), 10, 64)
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
-		log.Fatal("Failed to start Telegram bot:", err)
+		log.Fatal("Failed to start telegram bot:", err)
 	}
+	log.Printf("Telegram bot authorized on account %s", bot.Self.UserName)
 
-	log.Printf("Authorized on account %s", bot.Self.UserName)
-
-	// Repeatedly scan every X minutes
-	interval := 5 * time.Minute
-	for {
-		slots, err := fetchAvailableSlots(apiToken)
-		if err != nil {
-			log.Println("Error fetching slots:", err)
-		} else if len(slots) > 0 {
-			for _, slot := range slots {
-				msg := fmt.Sprintf("Available slot on %s from %s to %s", slot.Date, slot.StartTime, slot.EndTime)
-				if slot.Instructor != "" {
-					msg += " with instructor " + slot.Instructor
-				}
-				sendTelegramAlert(bot, chatID, msg)
-			}
-		} else {
-			log.Println("No available slots found")
+	// Run web server for Heroku ping
+	go func() {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("Bot is running"))
+		})
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
 		}
+		log.Fatal(http.ListenAndServe(":"+port, nil))
+	}()
 
-		log.Printf("Sleeping for %v before next check...\n", interval)
-		time.Sleep(interval)
+	// Start main loop
+	for {
+		checkSlots(bot, chatID)
+		// Random interval between 2–5 minutes
+		r := rand.Intn(180) + 120
+		log.Printf("Next scan in %d seconds", r)
+		time.Sleep(time.Duration(r) * time.Second)
 	}
 }
 
-// fetchAvailableSlots queries BBDC API for available 3A practical slots
-func fetchAvailableSlots(apiToken string) ([]SlotResponse, error) {
-	url := "https://booking.bbdc.sg/bbdc-back-service/api/booking/c3practical/listC3PracticalSlotReleased"
+func checkSlots(bot *tgbotapi.BotAPI, chatID int64) {
+	apiURL := "https://booking.bbdc.sg/bbdc-back-service/api/booking/c3practical/listC3PracticalSlotReleased"
 
+	token := os.Getenv("BBDC_TOKEN")
+	if token == "" {
+		log.Fatal("BBDC_TOKEN not set")
+	}
+
+	// Prepare request payload
 	payload := SlotRequest{
 		CourseType:      "3A",
 		InsInstructorId: "",
@@ -88,53 +93,51 @@ func fetchAvailableSlots(apiToken string) ([]SlotResponse, error) {
 		SubStageSubNo:   nil,
 		SubVehicleType:  nil,
 	}
+	jsonPayload, _ := json.Marshal(payload)
 
-	body, err := json.Marshal(payload)
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		return nil, err
+		log.Println("Error creating request:", err)
+		return
 	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
-	if err != nil {
-		return nil, err
-	}
-
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiToken)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		log.Println("Error sending request:", err)
+		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		respBody, _ := ioutil.ReadAll(resp.Body)
-		return nil, fmt.Errorf("bad response: %s", string(respBody))
-	}
-
-	respBody, err := ioutil.ReadAll(resp.Body)
+	body, _ := ioutil.ReadAll(resp.Body)
+	var apiResp ApiResponse
+	err = json.Unmarshal(body, &apiResp)
 	if err != nil {
-		return nil, err
+		log.Println("Error parsing JSON:", err)
+		return
 	}
 
-	var slots []SlotResponse
-	err = json.Unmarshal(respBody, &slots)
-	if err != nil {
-		return nil, err
+	if len(apiResp.Data) == 0 {
+		log.Println("No slots available")
+		sendTelegram(bot, chatID, "No slots available at this time")
+		return
 	}
 
-	return slots, nil
+	for _, slot := range apiResp.Data {
+		msg := fmt.Sprintf("Available slot on %s from %s to %s\nInstructor: %s\nVehicle: %s",
+			slot.BookingDate, slot.StartTime, slot.EndTime, slot.Instructor, slot.Vehicle)
+		sendTelegram(bot, chatID, msg)
+	}
 }
 
-// sendTelegramAlert sends a message to your Telegram chat
-func sendTelegramAlert(bot *tgbotapi.BotAPI, chatID int64, msg string) {
+func sendTelegram(bot *tgbotapi.BotAPI, chatID int64, msg string) {
 	message := tgbotapi.NewMessage(chatID, msg)
 	_, err := bot.Send(message)
 	if err != nil {
-		log.Println("Error sending Telegram message:", err)
+		log.Println("Failed to send telegram message:", err)
 	} else {
-		log.Println("Sent alert:", msg)
+		log.Println("Sent Telegram message:", msg)
 	}
 }
