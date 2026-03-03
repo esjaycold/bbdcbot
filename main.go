@@ -39,8 +39,12 @@ func main() {
 
 	//for heroku
 	go func() {
-		http.ListenAndServe(":"+os.Getenv("PORT"),
-			http.HandlerFunc(http.NotFound))
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte("Bot is running"))
+    })
+
+    log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
 	}()
 	for {
 		//fetching cookies
