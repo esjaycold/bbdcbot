@@ -71,7 +71,7 @@ func checkSlots(bbdcToken string, bot *tgbotapi.BotAPI, chatID int64) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
 	errCheck(err, "Error creating request")
 
-	req.Header.Set("Authorization", "Bearer "+bbdcToken)
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("BBDC_TOKEN"))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
