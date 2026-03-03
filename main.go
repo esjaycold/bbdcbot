@@ -4,19 +4,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// SlotRequest is the payload to query available slots
+const endpoint = "https://booking.bbdc.sg/bbdc-back-service/api/booking/c3practical/listC3PracticalTrainings"
+
 type SlotRequest struct {
 	CourseType      string      `json:"courseType"`
 	InsInstructorId string      `json:"insInstructorId"`
@@ -26,38 +24,41 @@ type SlotRequest struct {
 }
 
 func main() {
-	// Telegram setup
-	bot, err := tgbotapi.NewBotAPI(os.Getenv("TELEGRAM_TOKEN"))
-	errCheck(err, "Failed to start Telegram bot")
+	telegramToken := os.Getenv("TELEGRAM_TOKEN")
+	chatID := os.Getenv("TELEGRAM_CHAT_ID")
+	bbdcToken := os.Getenv("BBDC_TOKEN")
+
+	if telegramToken == "" || chatID == "" || bbdcToken == "" {
+		log.Fatal("Missing TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, or BBDC_TOKEN")
+	}
+
+	bot, err := tgbotapi.NewBotAPI(telegramToken)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	log.Printf("Telegram bot authorized: %s", bot.Self.UserName)
 
-	chatID, err := strconv.ParseInt(os.Getenv("CHAT_ID"), 10, 64)
-	errCheck(err, "Failed to fetch chat ID")
-
-	// Heroku ping endpoint (to keep awake)
+	// Heroku requires web server
 	go func() {
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("Bot is running"))
 		})
-		log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		http.ListenAndServe(":"+port, nil)
 	}()
 
-	bbdcToken := os.Getenv("BBDC_TOKEN")
-	if bbdcToken == "" {
-		log.Fatal("BBDC_TOKEN not set")
-	}
-
 	for {
-		checkSlots(bbdcToken, bot, chatID)
-		// Random delay between 2–5 minutes
-		r := rand.Intn(180) + 120
-		log.Printf("Next check in %d seconds", r)
-		time.Sleep(time.Duration(r) * time.Second)
+		checkSlots(bot, chatID, bbdcToken)
+		log.Println("Next check in 240 seconds")
+		time.Sleep(240 * time.Second)
 	}
 }
 
-func checkSlots(bbdcToken string, bot *tgbotapi.BotAPI, chatID int64) {
-	url := "https://booking.bbdc.sg/bbdc-back-service/api/booking/c3practical/listC3PracticalSlotReleased"
+func checkSlots(bot *tgbotapi.BotAPI, chatID string, token string) {
 
 	payload := SlotRequest{
 		CourseType:      "3A",
@@ -66,75 +67,59 @@ func checkSlots(bbdcToken string, bot *tgbotapi.BotAPI, chatID int64) {
 		SubStageSubNo:   nil,
 		SubVehicleType:  nil,
 	}
-	bodyBytes, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
-	errCheck(err, "Error creating request")
+	jsonData, _ := json.Marshal(payload)
 
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("BBDC_TOKEN"))
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Println("Request creation error:", err)
+		return
+	}
+
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Origin", "https://booking.bbdc.sg")
+	req.Header.Set("Referer", "https://booking.bbdc.sg/")
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
-	errCheck(err, "Error fetching slots")
+	if err != nil {
+		log.Println("Request error:", err)
+		return
+	}
 	defer resp.Body.Close()
 
-	respBody, _ := ioutil.ReadAll(resp.Body)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyString := string(bodyBytes)
 
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Error response from BBDC API: %s", resp.Status)
+	if resp.StatusCode != 200 {
+		log.Println("Non-200 response:", resp.Status)
+		log.Println("Response body:", bodyString)
 		return
 	}
 
-	var slots []map[string]interface{}
-	if err := json.Unmarshal(respBody, &slots); err != nil {
-		log.Println("Error parsing response JSON:", err)
-		return
-	}
-
-	if len(slots) == 0 {
-		log.Println("No slots available")
-		return
-	}
-
-	// Filter by environment variables
-	wantedMonths := strings.Split(os.Getenv("WANTED_MONTHS"), ",")
-	wantedSessions := strings.Split(os.Getenv("WANTED_SESSIONS"), ",")
-	wantedDays := strings.Split(os.Getenv("WANTED_DAYS"), ",")
-
-	for _, slot := range slots {
-		dateStr := fmt.Sprintf("%v", slot["date"]) // adjust field name if API returns something else
-		session := fmt.Sprintf("%v", slot["session"])
-		dayOfWeek := fmt.Sprintf("%v", slot["dayOfWeek"])
-
-		if contains(wantedMonths, dateStr) && contains(wantedSessions, session) && contains(wantedDays, dayOfWeek) {
-			alertMsg := fmt.Sprintf("Available slot on %s (Session %s, Day %s)", dateStr, session, dayOfWeek)
-			alert(alertMsg, bot, chatID)
-		}
-	}
-}
-
-func alert(msg string, bot *tgbotapi.BotAPI, chatID int64) {
-	telegramMsg := tgbotapi.NewMessage(chatID, msg)
-	if _, err := bot.Send(telegramMsg); err != nil {
-		log.Println("Error sending Telegram message:", err)
-	} else {
-		log.Println("Sent Telegram message:", msg)
-	}
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if strings.Contains(item, s) {
-			return true
-		}
-	}
-	return false
-}
-
-func errCheck(err error, msg string) {
+	// Try parsing JSON
+	var parsed interface{}
+	err = json.Unmarshal(bodyBytes, &parsed)
 	if err != nil {
-		log.Fatal(msg+": ", err)
+		log.Println("JSON parsing failed. Raw response below:")
+		log.Println(bodyString)
+		return
 	}
+
+	// Simple detection: if response contains slot data
+	if len(bodyBytes) > 200 {
+		msg := tgbotapi.NewMessage(parseChatID(chatID),
+			"🚨 BBDC SLOT POSSIBLY AVAILABLE!\n\nCheck now: https://booking.bbdc.sg/")
+		bot.Send(msg)
+		log.Println("Telegram alert sent.")
+	} else {
+		log.Println("No slots found.")
+	}
+}
+
+func parseChatID(chatID string) int64 {
+	var id int64
+	fmt.Sscan(chatID, &id)
+	return id
 }
